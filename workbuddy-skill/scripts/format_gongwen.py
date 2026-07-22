@@ -29,7 +29,7 @@ SIZE_BODY = Pt(16)                   # 三号
 FONT_HEITI = "黑体"                  # 一级标题字体
 FONT_KAITI = "楷体_GB2312"           # 二级标题字体
 
-# 表格（参照深圳港集团实际公文：仿宋小四、表头加粗、细单线边框）
+# 表格（仿宋小四、表头加粗、细单线边框）
 FONT_TABLE = "仿宋_GB2312"           # 表格字体
 SIZE_TABLE = Pt(14)                  # 小四（区别于正文三号）
 TABLE_HEADER_BOLD = True             # 表头行加粗
@@ -46,7 +46,7 @@ SIZE_BANJI = Pt(12)                  # 四号
 
 LINE_SPACING = Pt(28)                # 全文行距 28 磅（固定值）
 
-# 标准页边距 (GB/T 9704，参照深圳港集团实际公文)
+# 标准页边距 (GB/T 9704)
 PAGE_TOP = Cm(3.7)
 PAGE_BOTTOM = Cm(3.5)
 PAGE_LEFT = Cm(2.8)
