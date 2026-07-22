@@ -1,8 +1,41 @@
 # 公文格式排版
 
-按《党政机关公文格式》(GB/T 9704) 标准，将未排版的 .docx 文档自动排版为规范公文格式。
+按《党政机关公文格式》(GB/T 9704) 标准，将未排版 .docx 文档自动排版为规范公文格式。
 
-## 快速开始
+---
+
+## WorkBuddy Skill 安装（推荐）
+
+> 如果你用 [WorkBuddy](https://www.codebuddy.cn/)，以 Skill 方式安装可获得 AI 对话驱动的体验（自动预览→交互确认→排版→推送结果）。
+
+```bash
+# 1. 克隆仓库
+git clone https://github.com/whenhuang/Document-Processing.git
+
+# 2. 安装 Skill（拷贝到 WorkBuddy skills 目录）
+# Windows
+mkdir -p "%USERPROFILE%\.workbuddy\skills\gongwen-format\scripts"
+xcopy /E Document-Processing\workbuddy-skill\* "%USERPROFILE%\.workbuddy\skills\gongwen-format\"
+
+# macOS / Linux
+mkdir -p ~/.workbuddy/skills/gongwen-format/scripts
+cp -r Document-Processing/workbuddy-skill/* ~/.workbuddy/skills/gongwen-format/
+
+# 3. 安装依赖
+pip install python-docx
+
+# 4. 重新打开 WorkBuddy，对 AI 说：按公文格式排版
+```
+
+---
+
+## CLI 独立使用
+
+如果不用 WorkBuddy，可以直接跑脚本。
+
+```bash
+# 安装依赖
+pip install -r requirements.txt
 
 ```bash
 # 安装依赖
