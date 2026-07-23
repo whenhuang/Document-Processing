@@ -29,7 +29,7 @@ SIZE_BODY = Pt(16)                   # 三号
 FONT_HEITI = "黑体"                  # 一级标题字体
 FONT_KAITI = "楷体_GB2312"           # 二级标题字体
 
-# 表格（仿宋小四、表头加粗、细单线边框）
+# 表格（参照深圳港集团实际公文：仿宋小四、表头加粗、细单线边框）
 FONT_TABLE = "仿宋_GB2312"           # 表格字体
 SIZE_TABLE = Pt(14)                  # 小四（区别于正文三号）
 TABLE_HEADER_BOLD = True             # 表头行加粗
@@ -46,7 +46,7 @@ SIZE_BANJI = Pt(12)                  # 四号
 
 LINE_SPACING = Pt(28)                # 全文行距 28 磅（固定值）
 
-# 标准页边距 (GB/T 9704)
+# 标准页边距 (GB/T 9704，参照深圳港集团实际公文)
 PAGE_TOP = Cm(3.7)
 PAGE_BOTTOM = Cm(3.5)
 PAGE_LEFT = Cm(2.8)
@@ -130,6 +130,35 @@ def set_first_line_indent_chars(paragraph, chars):
     ind.set(qn('w:firstLine'), str(indent_pt * 20))
 
 
+def _set_indent_chars(paragraph, left_chars=None, first_line_chars=None, hanging_chars=None):
+    """仅设置缩进的 Chars 字符单位属性（不触 w:left/w:hanging/w:firstLine 磅值）。
+
+    WPS 优先用 Chars 单位显示"文本之前/之后"。磅值由 pf.left_indent 等属性单独设置。
+    """
+    pPr = paragraph._element.get_or_add_pPr()
+    ind = pPr.find(qn('w:ind'))
+    if ind is None:
+        ind = OxmlElement('w:ind')
+        pPr.append(ind)
+
+    if left_chars is not None:
+        ind.set(qn('w:leftChars'), str(int(left_chars * 100)))
+
+    if first_line_chars is not None:
+        ind.set(qn('w:firstLineChars'), str(int(first_line_chars * 100)))
+        # 清除悬挂属性，避免冲突
+        for attr in ('w:hangingChars',):
+            if ind.get(qn(attr)):
+                ind.attrib.pop(qn(attr), None)
+
+    if hanging_chars is not None:
+        ind.set(qn('w:hangingChars'), str(int(hanging_chars * 100)))
+        # 清除首行缩进属性，避免冲突
+        for attr in ('w:firstLineChars',):
+            if ind.get(qn(attr)):
+                ind.attrib.pop(qn(attr), None)
+
+
 def remove_empty_runs(paragraph):
     """清理段落的空 run"""
     for run in paragraph.runs:
@@ -185,25 +214,117 @@ def trim_paragraphs(paragraphs):
 
 
 def remove_empty_paragraphs(doc):
-    """删除文档 body 中的所有空段落（仅含空白字符的段落）"""
+    """删除文档 body 中的空段落，但保留附件前和文档末尾区域的空行。
+
+    - 附件前空行保留（作为附件与正文的段间距）
+    - 附件和落款日期之间保留 1 个空行
+    - 文档末尾的空行保留
+    """
     body = doc.element.body
-    removed = 0
-    # 收集需要删除的元素（不能在遍历时直接删除）
-    to_remove = []
+
+    # 仅 w:p 计数（不含表格等）
+    total_paragraphs = sum(1 for c in body if c.tag.endswith('}p'))
+
+    # 第一遍：识别所有附件和日期段落位置
+    attachment_p = set()  # 附件段落的段落序号
+    date_p = set()       # 日期段落的段落序号
+    p_index = 0
     for child in body:
         if child.tag.endswith('}p'):
-            # 检查组成为 <w:p> 的所有 run 文本是否为空
+            texts = []
+            for r in child.iter(qn('w:t')):
+                if r.text:
+                    texts.append(r.text)
+            full_text = ''.join(texts).strip()
+            if full_text and ATTACHMENT_PATTERN.match(full_text):
+                attachment_p.add(p_index)
+            if full_text and DATE_PATTERN.match(full_text):
+                date_p.add(p_index)
+            p_index += 1
+
+    # 第二遍：判断每个空段是否需要保留
+    p_index = 0
+    to_remove = []
+    last_kept_attachment = -1
+    for child in body:
+        if child.tag.endswith('}p'):
             texts = []
             for r in child.iter(qn('w:t')):
                 if r.text:
                     texts.append(r.text)
             full_text = ''.join(texts).strip()
             if not full_text:
-                to_remove.append(child)
+                # 规则1：附件前的空段保留（仅保留直接相邻附件的 1 个）
+                is_before_attachment = False
+                nxt = _next_paragraph_elem(child, body)
+                if nxt is not None:
+                    nxt_texts = []
+                    for r in nxt.iter(qn('w:t')):
+                        if r.text:
+                            nxt_texts.append(r.text)
+                    nxt_full = ''.join(nxt_texts).strip()
+                    if nxt_full and ATTACHMENT_PATTERN.match(nxt_full):
+                        is_before_attachment = True
+
+                # 规则2：附件块与签名块之间保留 1 个空段
+                # 签名块包括：落款单位、落款日期、联系人、版记
+                SIGNATURE_LABELS = (
+                    'date_signature', 'unit_signature',
+                    'contact', 'banji', 'signer', 'doc_number'
+                )
+                is_between_attach_and_signature = False
+                if not is_before_attachment and p_index > max(attachment_p, default=-1):
+                    nxt_p = _next_paragraph_elem(child, body)
+                    if nxt_p is not None:
+                        nxt_texts = []
+                        for r in nxt_p.iter(qn('w:t')):
+                            if r.text:
+                                nxt_texts.append(r.text)
+                        nxt_full = ''.join(nxt_texts).strip()
+                        # 下一段是落款日期 或 短无标点（可能是落款单位）
+                        if nxt_full and (
+                            DATE_PATTERN.match(nxt_full) or
+                            (len(nxt_full) < 30 and not nxt_full.endswith(('。', '！', '？', '.', '．', '：', ':')))
+                        ):
+                            is_between_attach_and_signature = True
+
+                # 规则3：文档末尾 1 个空段保留
+                is_last = p_index == total_paragraphs - 1
+
+                keep = is_before_attachment or is_between_attach_and_signature or is_last
+                if keep:
+                    # 保留的空段：统一应用 28pt 行距，避免高度不一致
+                    pPr = child.find(qn('w:pPr'))
+                    if pPr is None:
+                        pPr = OxmlElement('w:pPr')
+                        child.insert(0, pPr)
+                    # 设置 spacing
+                    spacing = pPr.find(qn('w:spacing'))
+                    if spacing is None:
+                        spacing = OxmlElement('w:spacing')
+                        pPr.append(spacing)
+                    spacing.set(qn('w:line'), '560')  # 28pt = 560 (20ths)
+                    spacing.set(qn('w:lineRule'), 'exact')
+                    spacing.set(qn('w:before'), '0')
+                    spacing.set(qn('w:after'), '0')
+                else:
+                    to_remove.append(child)
+            p_index += 1
     for elem in to_remove:
         body.remove(elem)
-        removed += 1
-    return removed
+    return len(to_remove)
+
+
+def _next_paragraph_elem(p_elem, body):
+    """返回 body 中 p_elem 的下一个 w:p 兄弟（跳过表格等）"""
+    found = False
+    for child in body:
+        if child is p_elem:
+            found = True
+            continue
+        if found and child.tag.endswith('}p'):
+            return child
+    return None
 
 
 def normalize_bullets(paragraph):
@@ -394,6 +515,37 @@ def apply_body_format(paragraph, first_indent=True):
         set_first_line_indent_chars(paragraph, 0)
 
 
+def normalize_attachment_text(paragraph):
+    """清理附件说明文本：
+    - 去除首尾的《》书名号
+    - 去除文件名末尾的中英文标点（。，．,;；）
+    """
+    for run in paragraph.runs:
+        if not run.text:
+            continue
+        text = run.text
+        text = re.sub(r'^《', '', text)
+        text = re.sub(r'》$', '', text)
+        text = re.sub(r'[。，．,;；]+$', '', text)
+        if text != run.text:
+            run.text = text
+
+
+# 半角→全角：仅在标题/附件场景下调用
+HALF_TO_FULL_DIGIT_DOT = re.compile(r'(\d+)\.(?!\d)')
+
+
+def normalize_serial_dots(paragraph):
+    """将标题/附件序号中的半角句点替换为全角句点（'1.' → '1．'）。
+    仅在 heading/attachment 段落调用；正文不动。"""
+    for run in paragraph.runs:
+        if not run.text:
+            continue
+        new_text = HALF_TO_FULL_DIGIT_DOT.sub(r'\1．', run.text)
+        if new_text != run.text:
+            run.text = new_text
+
+
 # ── 段落分类 ──────────────────────────────────────────────
 
 # 标题关键词匹配（必须以"关于"开头，避免正文中引用文件名被误判）
@@ -407,8 +559,11 @@ RECIPIENT_PATTERN = re.compile(r'^[^：:]+[：:]$')
 # 层级标题
 HEADING_1_PATTERN = re.compile(r'^[一二三四五六七八九十]+、')         # 一、
 HEADING_2_PATTERN = re.compile(r'^（[一二三四五六七八九十]+）')        # （一）
-HEADING_3_PATTERN = re.compile(r'^\d+[\.\、]')                       # 1. 或 1、
+HEADING_3_PATTERN = re.compile(r'^\d+[\.\、\．]')                       # 1. 或 1、或 1．
 HEADING_4_PATTERN = re.compile(r'^（\d+）')                           # （1）
+
+# 图片标题（架构图/流程图/示意图等）：居中、仿宋小四、无首行缩进
+IMAGE_CAPTION_PATTERN = re.compile(r'.*(架构图|流程图|示意图|效果图|结构图|框架图|拓扑图|部署图|界面图|样图|截图)\s*$')
 
 # —— 开头段落（疑似未编号小标题，待用户确认是否转为正式标题）
 # 同时匹配 normalize_bullets 会转换的各种 bullet 字符（·•●■◆✦＊‣⁃･）
@@ -417,8 +572,8 @@ BULLET_HEADING_PATTERN = re.compile(r'^[\u2014\u2014\u00b7\u2022\u25cf\u25a0\u27
 # 附件
 ATTACHMENT_PATTERN = re.compile(r'^附件[：:\s]*\d*')
 
-# 落款（日期）
-DATE_PATTERN = re.compile(r'^\d{4}年\d{1,2}月\d{1,2}日$')
+# 落款（日期）— 支持 "2024年6月XX日" 等占位格式
+DATE_PATTERN = re.compile(r'^\d{4}年\d{1,2}月(\d{1,2}|[Xx]+)日$')
 
 # 联系人
 CONTACT_PATTERN = re.compile(r'[（(]\s*联系人\s*[：:].+[）)]?$')
@@ -490,6 +645,10 @@ def classify_paragraph(text, index, total):
     # 版记（抄送/印发）
     if BANJI_PATTERN.search(text_stripped):
         return 'banji'
+
+    # 图片标题（如"XX架构图"）：居中、仿宋小四
+    if IMAGE_CAPTION_PATTERN.match(text_stripped):
+        return 'image_caption'
 
     # 日期落款（文档末尾附近）
     if index > total * 0.7 and DATE_PATTERN.match(text_stripped):
@@ -683,7 +842,7 @@ def apply_recipient_format(paragraph):
 def apply_heading1_format(paragraph):
     """一级标题：黑体三号"""
     pf = paragraph.paragraph_format
-    pf.alignment = WD_ALIGN_PARAGRAPH.JUSTIFY
+    pf.alignment = WD_ALIGN_PARAGRAPH.LEFT
     pf.left_indent = Pt(0)
     set_first_line_indent_chars(paragraph, 2)
     set_line_spacing(paragraph, LINE_SPACING)
@@ -704,19 +863,57 @@ def apply_heading3_format(paragraph):
     """三级标题：仿宋三号"""
     apply_body_format(paragraph)
     # 三级标题号后不加粗
+    normalize_serial_dots(paragraph)
 
 
 def apply_heading4_format(paragraph):
     """四级标题：仿宋三号"""
     apply_body_format(paragraph)
+    normalize_serial_dots(paragraph)
 
 
-def apply_attachment_format(paragraph):
-    """附件格式：仿宋三号"""
+def apply_attachment_format(paragraph, attachment_index=1, total_attachments=1):
+    """附件格式：仿宋三号，按附件序号和总数应用不同的悬挂缩进。
+
+    规则（参考用户实际公文格式）：
+    - 1个附件（无序号）: 左缩进0，首行缩进2字符
+    - 附件1: 左缩进6.5字符，首行缩进-4.5字符（"1."前2字符起始，续行6.5字符）
+    - 附件2+: 左缩进6.5字符，首行缩进-1.5字符（"N."前5字符起始，续行6.5字符）
+
+    关键：同时设置 w:left/leftChars（磅+字符双单位），避免源文档遗留的
+    leftChars=0 等属性覆盖新的 left 值（WPS 优先用 Chars 单位）。
+    """
+    # 文本规范化：去书名号、去末尾标点
+    normalize_attachment_text(paragraph)
+    # 半角→全角序号点（仅在附件场景）
+    normalize_serial_dots(paragraph)
+
     pf = paragraph.paragraph_format
     pf.alignment = WD_ALIGN_PARAGRAPH.LEFT
-    pf.left_indent = Pt(0)
-    set_first_line_indent_chars(paragraph, 2)  # 附件序号缩进
+    char_pt = SIZE_BODY.pt  # 三号字单字符宽度
+
+    if total_attachments == 1:
+        # 1个附件（无序号）：左缩进0，首行缩进2字符
+        pf.left_indent = Pt(0)
+        pf.first_line_indent = Pt(2 * char_pt)
+        _set_indent_chars(paragraph, left_chars=0, first_line_chars=2)
+    elif attachment_index == 1:
+        # 附件1：left=6.5ch, hanging=4.5ch
+        # leftChars/hangingChars 按参考文档值（WPS 优先用 Chars 单位显示"文本之前"）
+        left = 6.5 * char_pt
+        hang = 4.5 * char_pt
+        pf.left_indent = Pt(left)
+        pf.first_line_indent = Pt(-hang)
+        _set_indent_chars(paragraph, left_chars=3.05, hanging_chars=4.5)
+    else:
+        # 附件2+：left=6.5ch, hanging=1.5ch
+        # leftChars/hangingChars 按参考文档值
+        left = 6.5 * char_pt
+        hang = 1.5 * char_pt
+        pf.left_indent = Pt(left)
+        pf.first_line_indent = Pt(-hang)
+        _set_indent_chars(paragraph, left_chars=7.62, hanging_chars=1.5)
+
     set_line_spacing(paragraph, LINE_SPACING)
     format_all_runs(paragraph, FONT_BODY, SIZE_BODY)
 
@@ -835,7 +1032,145 @@ def apply_banji_format(paragraph):
     format_all_runs(paragraph, FONT_BANJI, SIZE_BANJI)
 
 
+def apply_image_caption_format(paragraph):
+    """图片标题（如"XX架构图"）：仿宋小四、居中、无首行缩进"""
+    pf = paragraph.paragraph_format
+    pf.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    pf.left_indent = Pt(0)
+    set_first_line_indent_chars(paragraph, 0)
+    set_line_spacing(paragraph, LINE_SPACING)
+    format_all_runs(paragraph, FONT_BODY, SIZE_TABLE)  # 仿宋小四(14pt)
+
+
 # ── 后处理：智能识别落款 ──────────────────────────────────
+
+
+def _fix_sequential_attachments(paragraphs, labels):
+    """修复连续附件编号：将"附件：1.xxx"后的"2.xxx""3.xxx"重标为附件。
+
+    源文档中常见格式：第一行写"附件：1.xxx"，后续行写"2.xxx""3.xxx"
+    但没带"附件"前缀，被 classify_paragraph 误判为 body/heading3。
+    此函数扫描并纠正，不添加前缀（参考文档中附件2/3就是纯数字编号）。
+    """
+    texts = [p.text.strip() for p in paragraphs]
+    for i, label in enumerate(labels):
+        if label == 'attachment':
+            attach_text = texts[i]
+            attach_match = re.match(r'^附件[：:\s]*(\d+)[\.\．]', attach_text)
+            if attach_match:
+                base_num = int(attach_match.group(1))
+                next_num = base_num + 1
+                for j in range(i + 1, len(labels)):
+                    if labels[j] in ('heading3', 'heading4', 'body'):
+                        next_text = texts[j]
+                        if re.match(rf'^{next_num}[\.\．]', next_text):
+                            labels[j] = 'attachment'
+                            next_num += 1
+                        else:
+                            break
+                    elif labels[j] in ('heading1', 'heading2', 'attachment', 'empty'):
+                        continue
+                    else:
+                        break
+
+
+def _fix_unnumbered_headings(paragraphs, labels):
+    """将短正文段落提升为 heading1（无编号标题）。
+
+    两种模式：
+    1. 热启动：文档已有 heading1，从其位置向后扫描提升后续短正文
+    2. 冷启动：文档无任何 heading1，按段间特征检测一级标题（短正文+后有更长正文）
+    """
+    texts = [p.text.strip() for p in paragraphs]
+    promoted = 0
+    has_heading1 = any(lb == 'heading1' for lb in labels)
+
+    if has_heading1:
+        # 热启动：从已有 heading1 向后扫描
+        last_heading1 = -1
+        for i in range(len(labels)):
+            if labels[i] == 'heading1':
+                last_heading1 = i
+            elif labels[i] == 'body' and last_heading1 >= 0:
+                t = texts[i]
+                if len(t) < 30 and not t.endswith(('。', '！', '？', '.', '．')):
+                    if i + 1 < len(labels) and labels[i + 1] == 'body':
+                        if len(texts[i + 1]) >= len(t):
+                            labels[i] = 'heading1'
+                            last_heading1 = i
+                            promoted += 1
+    else:
+        # 冷启动：扫描所有短正文作为候选一级标题（<20字、无句末标点、后有更长段落）
+        # 过滤规则：不以"主要"开头、不以"："结尾（通常是列表引导句，非标题）
+        last_heading1 = -1
+        for i in range(len(labels)):
+            if labels[i] == 'body':
+                t = texts[i]
+                # 过滤：以"主要"开头的子标题、以"："结尾的引导句
+                if t.startswith('主要') or t.endswith('：') or t.endswith(':'):
+                    continue
+                if len(t) < 20 and not t.endswith(('。', '！', '？', '.', '．')):
+                    if i + 1 < len(labels) and labels[i + 1] in ('body', 'heading2', 'heading3', 'heading4'):
+                        if texts[i + 1] and len(texts[i + 1]) >= len(t):
+                            labels[i] = 'heading1'
+                            last_heading1 = i
+                            promoted += 1
+    return promoted
+
+
+def _ensure_title_paragraph(labels, texts):
+    """确认标题段落（支持首段空段场景）并合并多段标题。
+
+    3 步：
+    1. 如果有 'title'：保留
+    2. 如果有 'title_candidate'：提升为 'title'
+    3. 如果首段是 empty：找下一个非空短正文（<30字、无句末标点）作为 title
+    4. 标题提升后，紧随的短正文也并入 title（处理手工换行标题）
+    """
+    title_found = False
+    title_idx = -1
+    for i, label in enumerate(labels):
+        if label == 'title':
+            title_found = True
+            title_idx = i
+            break
+    if not title_found:
+        for i, label in enumerate(labels):
+            if label == 'title_candidate':
+                labels[i] = 'title'
+                title_found = True
+                title_idx = i
+                break
+    if not title_found:
+        skip = ['集团领导：', '集团：', '各部门：', '各有关单位：', '尊敬的', '您好']
+        for i, label in enumerate(labels):
+            if label == 'body' and texts[i].strip():
+                t = texts[i].strip()
+                if len(t) < 30 and not t.endswith(('。', '！', '？', '.', '．', '：', ':')):
+                    if not any(t.startswith(s) for s in skip):
+                        labels[i] = 'title'
+                        title_found = True
+                        title_idx = i
+                        break
+
+    # 多段标题合并
+    if title_idx >= 0:
+        for j in range(title_idx + 1, len(labels)):
+            lb = labels[j]
+            if lb in ('heading1', 'heading2', 'heading3', 'heading4', 'recipient',
+                      'attachment', 'date_signature', 'unit_signature', 'contact',
+                      'doc_number', 'signer', 'banji', 'end_text', 'image_caption'):
+                break
+            if lb == 'body':
+                t = texts[j].strip()
+                if t and len(t) < 30 and not t.endswith(('。', '！', '？', '.', '．', '：', ':')):
+                    skip2 = ['集团领导：', '集团：', '各部门：', '各有关单位：']
+                    if not any(t.startswith(s) for s in skip2):
+                        labels[j] = 'title'
+                        continue
+                break
+            else:
+                break
 
 
 def post_process_signatures(paragraphs, labels):
@@ -852,9 +1187,14 @@ def post_process_signatures(paragraphs, labels):
             # 空段落 → 可能是间距
             continue
 
+        # 保护：附件段落不参与落款识别
+        if labels[i] == 'attachment':
+            continue
+
         # 日期段落
-        if DATE_PATTERN.match(text) and labels[i] not in ('date_signature',):
-            labels[i] = 'date_signature'
+        if DATE_PATTERN.match(text):
+            if labels[i] != 'date_signature':
+                labels[i] = 'date_signature'
             guess_date = i
             continue
 
@@ -877,6 +1217,7 @@ LABEL_NAMES = {
     'contact': '【联系人】', 'end_text': '【结尾】', 'body': '【正文】',
     'bullet_heading': '【——小标题】',
     'doc_number': '【发文字号】', 'signer': '【签发人】', 'banji': '【版记】',
+    'image_caption': '【图片标题】',
     'empty': '',
 }
 
@@ -1344,6 +1685,11 @@ def format_document(input_path, output_path=None, preview_only=False,
     texts = [p.text for p in paragraphs]
     labels = [classify_paragraph(t, i, total) for i, t in enumerate(texts)]
 
+    # 3.5 修复无编号标题和连续附件（必须在诊断前运行，确保诊断能检测层级问题）
+    if not auto_mode:
+        _fix_unnumbered_headings(paragraphs, labels)
+        _fix_sequential_attachments(paragraphs, labels)
+
     # 4. 全要素诊断
     diagnosis = diagnose_document(doc, paragraphs, labels)
 
@@ -1353,20 +1699,17 @@ def format_document(input_path, output_path=None, preview_only=False,
         changes['quotes_double'] += dbl
         changes['quotes_single'] += sgl
 
-    # 6. 后处理：智能识别落款
-    post_process_signatures(paragraphs, labels)
+    # 5.5 修复：连续附件编号（如"附件：1.xxx"后"2.xxx""3.xxx"未带"附件"前缀）
+    # 将紧跟附件段落后的连续数字标题（heading3）重标为 attachment
+    if not auto_mode:
+        _fix_sequential_attachments(paragraphs, labels)
 
-    # 7. 后处理：将第一个非空正文候选确认为标题
-    title_found = False
-    for i, label in enumerate(labels):
-        if label == 'title':
-            title_found = True
-            break
-    if not title_found:
-        for i, label in enumerate(labels):
-            if label == 'title_candidate':
-                labels[i] = 'title'
-                break
+    # 5.6 修复：无编号一级标题（如"通过公司对公账户..."跟在 heading1 后但没写"二、"）
+    _fix_unnumbered_headings(paragraphs, labels)
+    _fix_sequential_attachments(paragraphs, labels)
+
+    # 6. 后处理：确认标题段落（包含多段标题合并逻辑）
+    _ensure_title_paragraph(labels, texts)
 
     # 8. 打印结构预览（含全要素诊断报告）
     structure_preview = print_structure(paragraphs, labels, diagnosis)
@@ -1396,6 +1739,12 @@ def format_document(input_path, output_path=None, preview_only=False,
 
     # 重新分类（因为段落数可能变化）
     labels = [classify_paragraph(t, i, total) for i, t in enumerate(texts)]
+    # 重新修复：无编号标题检测（重分类后可能丢失）
+    _fix_unnumbered_headings(paragraphs, labels)
+    # 重新修复：连续附件检测（重分类后可能丢失）
+    _fix_sequential_attachments(paragraphs, labels)
+    # 重新识别标题（含多段标题合并）—— 首段空段时需要重新触发
+    _ensure_title_paragraph(labels, texts)
 
     # 9.5 多段落标题合并：首段为标题时，将紧随其后的"纯标题续行"也并入标题，
     # 避免长标题被手工换行成多段后被误判为正文（如本行不以句号结尾且较短、且全文尚未出现一级标题）。
@@ -1404,7 +1753,7 @@ def format_document(input_path, output_path=None, preview_only=False,
             lb = labels[j]
             if lb in ('heading1', 'heading2', 'heading3', 'heading4', 'recipient',
                       'attachment', 'date_signature', 'unit_signature', 'contact',
-                      'doc_number', 'signer', 'banji', 'end_text', 'empty'):
+                      'doc_number', 'signer', 'banji', 'end_text', 'image_caption', 'empty'):
                 break
             if lb == 'body':
                 t = texts[j].strip()
@@ -1424,6 +1773,25 @@ def format_document(input_path, output_path=None, preview_only=False,
         # 编号变更后重新分类（如 3、→（三）后类别从 heading3 变为 heading2）
         texts = [p.text for p in paragraphs]
         labels = [classify_paragraph(t, i, total) for i, t in enumerate(texts)]
+        # 重新修复：无编号标题检测（重分类后可能丢失）
+        _fix_unnumbered_headings(paragraphs, labels)
+        # 重新修复：连续附件检测（重分类后可能丢失）
+        _fix_sequential_attachments(paragraphs, labels)
+        # 重新识别标题（hierarchy fix 可能改文本，需重做）
+        _ensure_title_paragraph(labels, texts)
+
+    # 9.6.5 后处理：智能识别落款（在所有段落重排/重分类后调用，避免索引错位）
+    post_process_signatures(paragraphs, labels)
+
+    # 9.7 附件计数与索引分配（用于多级悬挂缩进分发）
+    # 按出现顺序为所有 attachment 段落分配 index，并统计总数
+    attachment_total = sum(1 for lb in labels if lb == 'attachment')
+    attachment_index_map = {}  # 段落索引 -> 附件序号（1-based）
+    cur_index = 0
+    for i, lb in enumerate(labels):
+        if lb == 'attachment':
+            cur_index += 1
+            attachment_index_map[i] = cur_index
 
     # 10. 应用格式
     for i, paragraph in enumerate(paragraphs):
@@ -1451,7 +1819,8 @@ def format_document(input_path, output_path=None, preview_only=False,
         elif label == 'heading4':
             apply_heading4_format(paragraph)
         elif label == 'attachment':
-            apply_attachment_format(paragraph)
+            idx = attachment_index_map.get(i, 1)
+            apply_attachment_format(paragraph, attachment_index=idx, total_attachments=attachment_total)
         elif label == 'date_signature':
             apply_signature_format(paragraph)
         elif label == 'unit_signature':
@@ -1466,6 +1835,8 @@ def format_document(input_path, output_path=None, preview_only=False,
             apply_signer_format(paragraph)
         elif label == 'banji':
             apply_banji_format(paragraph)
+        elif label == 'image_caption':
+            apply_image_caption_format(paragraph)
         elif label == 'body':
             apply_body_format(paragraph)
         elif label == 'bullet_heading':
